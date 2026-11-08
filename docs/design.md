@@ -59,6 +59,32 @@ granted cores. Cross-platform (Windows taskkill fallback).
   then SIGKILL after grace).
 * Retries: fixed/exponential + jitter + max-delay; `TRY 2 PASS` → `flaky`.
 
+## Agent wait primitive (`wait`/`poll` + `run --background`)
+
+Agents launch 300s runs and need to block efficiently without writing
+`while status; do sleep; done` loops over `status`/`runs`.
+
+* `run --background` (`--detach`): validate the gates synchronously in the
+  parent (failures still exit 2 immediately), reserve `runs/<id>/`
+  atomically (`create_dir`, so two launches with the same `--run-id` race
+  safely — loser exits 2), then re-exec self as
+  `run --background-child --run-id <id> <original argv sans --background>`,
+  `setsid` on unix, stdout/stderr → `runs/<id>/broker.log`. Parent prints
+  only the id (or `{"run_id":"…"}` with `--json`) and exits 0. Original argv
+  is reused verbatim so `--cargo-args`/`--` pass-through semantics survive.
+* `wait` (alias `poll`) `<RUN_ID>…` / `--test <name>`: polls
+  timings/active/queue every `--interval` (default 2s) until every target is
+  Done (timing record exists) or Cancelled (seen active/queued then vanished
+  with no record). Exit mirrors the run: 0 pass, 1 fail/cancelled, 2 unknown,
+  124 wait-timeout. `--json` prints the final result as one object/array;
+  `--verbose` prints `queued #N` / `active … remaining` ticks to stderr.
+  `wait --test` discovers active/queued runs of the test *plus* timing
+  records finished since (30s lookback) the wait began, so a short run that
+  lives less than one poll interval is still captured via its record.
+* `status --poll` blocks until active+queue are empty. Unknown ids exit 2
+  after a 30s grace (typo'd ids do not hang forever); shorter `--timeout`
+  wins.
+
 ## Roadmap (not yet)
 
 * per-test-function isolation (`cargo test -- --list` discovery, each fn own process)
@@ -68,8 +94,10 @@ granted cores. Cross-platform (Windows taskkill fallback).
 
 ## Testing
 
-26 unit tests (budget admission/queue/release/replace, timing stats +
-scaling + JSONL roundtrip, timeout/slow/terminate, retries→flaky, junit
-escaping, justification/seen-estimate gates, percentile/backoff/duration
-parsers). Integration tests run the gates against `sh -c` fakes so CI stays
-fast without a full `cargo test` build.
+36 unit tests (budget admission/queue/release/replace/duplicate-guard,
+timing stats + scaling + JSONL roundtrip, timeout/slow/terminate,
+retries→flaky, junit escaping, justification/seen-estimate gates,
+percentile/backoff/duration parsers, poll snapshots + wait aggregation +
+idle). Integration tests run the gates against `sh -c` fakes plus CLI
+parsing for `wait`/`poll`/`--background`/`--poll` so CI stays fast without
+a full `cargo test` build.

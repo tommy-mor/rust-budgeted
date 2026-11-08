@@ -6,6 +6,7 @@ pub mod budget;
 pub mod cli;
 pub mod config;
 pub mod executor;
+pub mod poll;
 pub mod reporter;
 pub mod runner;
 pub mod state_dir;

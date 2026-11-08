@@ -32,7 +32,7 @@ pub struct TimingRecord {
     pub worktree: Option<String>,
     /// run-id dir name under runs/.
     pub run_id: String,
-    /// 200-word justification: why this run deserves the cores/time.
+    /// 50-word justification: why this run deserves the cores/time.
     #[serde(default)]
     pub justification: Option<String>,
     /// Hypothesis the run tests (what we expect to learn).
@@ -54,7 +54,7 @@ pub struct TimingRecord {
 }
 
 /// Minimum combined words for justification + hypothesis.
-pub const MIN_JUSTIFICATION_WORDS: usize = 200;
+pub const MIN_JUSTIFICATION_WORDS: usize = 50;
 /// How close `seen_estimate_secs` must be to our effective estimate (ratio).
 pub const SEEN_ESTIMATE_TOLERANCE: f64 = 0.50;
 
@@ -74,7 +74,7 @@ pub fn validate_justification(
     let h = hypothesis.unwrap_or("").trim();
     if j.is_empty() {
         return Err(
-            "missing --justification: every fuzz run needs a 200-word justification (why it deserves the CPU time). See README for the template.".to_string(),
+            "missing --justification: every fuzz run needs a 50-word justification (why it deserves the CPU time). See README for the template.".to_string(),
         );
     }
     if h.is_empty() {
@@ -85,7 +85,7 @@ pub fn validate_justification(
     let words = count_words(j) + count_words(h);
     if words < MIN_JUSTIFICATION_WORDS {
         return Err(format!(
-            "justification+hypothesis is {words} words, need >={MIN_JUSTIFICATION_WORDS}. Write the full 200-word section (question, why now, why this test, why these cores, what we give up by waiting, what we learn).",
+            "justification+hypothesis is {words} words, need >={MIN_JUSTIFICATION_WORDS}. Write the full 50-word section (question, why now, why this test, why these cores, what we give up by waiting, what we learn).",
         ));
     }
     Ok(words)

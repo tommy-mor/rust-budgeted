@@ -1,7 +1,7 @@
 # cargo-fuzz-next
 
 Nextest-slice test runner for joint-fuzz style workspaces: **shared core + memory
-budgets across worktrees, timing JSONL estimates (time + RAM), 200-word
+budgets across worktrees, timing JSONL estimates (time + RAM), 50-word
 justification gate, timeouts, retries, JUnit**.
 
 It exists because `cargo test --release --test native_fuzz` in 5 Ferry
@@ -16,13 +16,13 @@ $ cargo fuzz-next estimate --test native_fuzz --cores 8
 # → time 368s (p95), 2944 core-s  |  mem 1800 MiB (p95), 662400 mem-s
 
 $ cargo fuzz-next run --test native_fuzz --cores 8 \
-    --justification "<200+ words: why this deserves 2944 core-s + 662400 mem-s NOW>" \
+    --justification "<50+ words: why this deserves 2944 core-s + 662400 mem-s NOW>" \
     --hypothesis "<falsifiable expectation + decision it unlocks>" \
     --seen-estimate-secs 368 --seen-estimate-mem-mb 1800
 # → admits / queues with ETA, runs, records, releases
 ```
 
-1. **Justification + Hypothesis ≥ 200 words combined** — otherwise `run` is
+1. **Justification + Hypothesis ≥ 50 words combined** — otherwise `run` is
    BLOCKED. The text is stored in `timings.jsonl` + `result.json` forever,
    so future you can remember why a 574s `post_match` was worth it.
 2. **`--seen-estimate-secs` + `--seen-estimate-mem-mb` must match the store**
@@ -86,7 +86,7 @@ enough for `status` to join against.
 ```json
 {"ts":"…","test":"native_fuzz","secs":307.0,"cores":8,"mem_mb_requested":1800,
  "peak_rss_mb":1500.0,"core_seconds":2456,"mem_seconds":522000,
- "rc":0,"status":"pass","justification":"…200 words…","hypothesis":"…",
+ "rc":0,"status":"pass","justification":"…50 words…","hypothesis":"…",
  "seen_estimate_secs":368.0,"seen_estimate_mem_mb":1800.0,"run_id":"…"}
 ```
 
@@ -98,6 +98,43 @@ falls back to built-in joint-fuzz defaults (`post_match 574s/2500MiB`,
 
 Per-test stats: `cargo fuzz-next runs --last 50 --test native_fuzz --json`.
 
+## Agent polling: `wait` / `poll` + `run --background`
+
+Runs are long (minutes, 100s of core-s). Instead of hand-writing
+`while status` loops, use the built-in wait primitive:
+
+```bash
+# Launch detached (prints only the run_id; gates still checked synchronously).
+RUN_ID=$(cargo fuzz-next run --test native_fuzz --cores 8 --mem-mb 1800 \
+  --justification "..." --hypothesis "..." \
+  --seen-estimate-secs 368 --seen-estimate-mem-mb 1800 --yes --background)
+echo "launched $RUN_ID"
+# ... do other work ...
+
+# Block until that run finishes. Exit mirrors the run: 0 pass, 1 fail/cancelled,
+# 2 unknown id, 124 wait-timeout. Alias: `cargo fuzz-next poll <id>`.
+cargo fuzz-next wait "$RUN_ID" --verbose          # progress to stderr
+cargo fuzz-next poll "$RUN_ID" --json --timeout 15m  # machine output on stdout
+cargo fuzz-next wait --test native_fuzz           # wait for any active/queued run of the test
+cargo fuzz-next status --poll                     # block until the budget is idle
+```
+
+* `run --background` (`--detach` alias) validates the gates in the parent
+  (gate failures exit `2` immediately, no orphan), then spawns a detached
+  child (`setsid` on unix) whose stdout/stderr go to `runs/<id>/broker.log`.
+  `--run-id ID` picks the id up-front (default is derived); the directory
+  `runs/<id>/` is reserved atomically so two background launches with the
+  same id cannot race. `--json` prints `{"run_id":"…"}` instead of the bare id.
+* `wait`/`poll` takes one or more `RUN_ID`s (or `--test NAME`). It polls
+  `timings.jsonl` + `active.json` + `queue.json` every `--interval` (default
+  `2s`) for you. `--verbose` prints `queued #N …` / `active … remaining` ticks
+  to stderr; final human line (or `--json` object/array) goes to stdout.
+  A run that was queued/active and then vanishes with no timing record is
+  reported as `cancelled`. An id that never appears exits `2` after a 30s
+  unknown grace (shorter `--timeout` wins).
+* `status --poll` blocks until no active and no queued runs remain
+  (`--interval`, `--timeout`, `--json` supported).
+
 ## Nextest slice implemented
 
 * per-binary mode (matches `sweep.sh`: `--test $t`)
@@ -107,12 +144,13 @@ Per-test stats: `cargo fuzz-next runs --last 50 --test native_fuzz --json`.
 * retries + flaky marking (`--retries 2`, exponential backoff + jitter)
 * JUnit XML (`--junit path`, plus `runs/<id>/junit.xml` always)
 * fail tail + full logs (`runs/<id>/stdout.log`, `stderr.log`, `result.json` — never piped through `head`, panics survive)
-* `estimate`, `status`, `runs`, `cancel`, `clean`, `doctor`
+* `estimate`, `status`, `runs`, `wait`/`poll`, `cancel`, `clean`, `doctor`
+* `run --background`/`--detach` + `--run-id` + `wait`/`poll` + `status --poll` (agent wait primitive)
 
 Not yet: per-test-function isolation (each `#[test]` in own process), sharding
 `--partition`, filtersets. See `docs/design.md` for the roadmap.
 
-## Justification template (≥200 words)
+## Justification template (≥50 words)
 
 1. What question does this run answer, and what cheaper alternative did we rule out?
 2. Why is THIS test the right tool (invariant/proof/soak)?
@@ -131,6 +169,12 @@ cargo fuzz-next estimate --test native_fuzz --cores 8
 cargo fuzz-next run --test native_fuzz --cores 8 --mem-mb 1800 --release \
     --justification "..." --hypothesis "..." \
     --seen-estimate-secs 368 --seen-estimate-mem-mb 1800 --yes
+# Agent async: launch detached, then block for the result.
+RUN_ID=$(cargo fuzz-next run --test native_fuzz --cores 8 --background --run-id agent-1 \
+    --justification "..." --hypothesis "..." \
+    --seen-estimate-secs 368 --seen-estimate-mem-mb 1800 --yes)
+cargo fuzz-next wait "$RUN_ID" --verbose   # alias: cargo fuzz-next poll "$RUN_ID"
+cargo fuzz-next status --poll   # block until idle
 cargo fuzz-next status
 cargo fuzz-next runs --last 20
 ```

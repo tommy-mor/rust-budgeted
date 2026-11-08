@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::executor::{build_test_command, fmt_dur, run_with_timeouts};
 use crate::reporter::{format_human, write_junit, write_result_json, RunSummary};
 use crate::timings::{
-    count_words, validate_justification, validate_seen_estimate, TimingRecord, TimingStore,
+    validate_justification, validate_seen_estimate, TimingRecord, TimingStore,
 };
 use crate::util::{parse_duration, RetryPolicy};
 
@@ -38,6 +38,11 @@ pub struct RunRequest {
     pub verbose: bool,
     pub worktree: Option<String>,
     pub sha: Option<String>,
+    /// Explicit run-id (validated); `None` derives one from time/test/pid.
+    pub run_id: Option<String>,
+    /// Machine-readable output: suppress human printing on stdout (JSON is
+    /// printed by the caller / `result.json` still written).
+    pub json: bool,
 }
 
 pub struct RunResult {
@@ -50,7 +55,11 @@ pub struct RunResult {
     pub budget_active_mem_after: usize,
 }
 
-fn make_run_id(test: &str) -> String {
+/// Derive a unique run id (timestamp-test-pid-random). Public so the
+/// `--background` launcher can mint the id before spawning the child and
+/// print it for a later `wait`/`poll`.
+#[must_use]
+pub fn make_run_id(test: &str) -> String {
     let now = Utc::now();
     let pid = std::process::id();
     let rand_part: u32 = (rand::random::<u32>()) % 10000;
@@ -63,25 +72,43 @@ fn make_run_id(test: &str) -> String {
     )
 }
 
-fn worktree_name() -> String {
-    std::env::current_dir()
-        .ok()
-        .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
-        .unwrap_or_else(|| "unknown".to_string())
+/// Validate an explicit `--run-id`: non-empty, no path separators / traversal,
+/// no whitespace. The id is used as a directory name under `runs/`.
+pub fn validate_run_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("--run-id must not be empty".to_string());
+    }
+    if id == "." || id == ".." {
+        return Err(format!("invalid --run-id {id:?}: reserved name"));
+    }
+    if id.contains('/')
+        || id.contains('\\')
+        || id.contains('\0')
+        || id.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(format!(
+            "invalid --run-id {id:?}: no slashes, whitespace, or control characters"
+        ));
+    }
+    if id.len() > 128 {
+        return Err(format!("invalid --run-id: too long ({} > 128 chars)", id.len()));
+    }
+    Ok(())
 }
 
-fn git_sha() -> Option<String> {
-    std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+/// Result of the pre-flight gates (estimate + justification + approval).
+pub struct Preflight {
+    pub estimate_secs: f64,
+    pub estimate_mem_mb: f64,
+    pub mem_mb_requested: usize,
+    pub just_words: usize,
 }
 
-/// Full run flow. On any gate failure (justification / seen-estimate / approval)
-/// returns Err(String) with human instructions and exit-code guidance (typed as Err).
-pub fn run(req: RunRequest, cfg: &Config) -> Result<RunResult, String> {
+/// Run the estimate + justification/seen-estimate/approval gates without
+/// touching the budget or executing anything. Used by `run` itself and by
+/// the `--background` launcher so a gate failure is reported synchronously
+/// (exit 2) instead of surfacing later inside the detached child.
+pub fn validate_preflight(req: &RunRequest, cfg: &Config) -> Result<Preflight, String> {
     let cores = req.cores.max(1);
     let state_dir = cfg.effective_state_dir();
     let store = TimingStore::new(state_dir.join("timings.jsonl"));
@@ -179,8 +206,51 @@ pub fn run(req: RunRequest, cfg: &Config) -> Result<RunResult, String> {
         return Err(format!("NEEDS-APPROVAL: {msg}"));
     }
 
+    Ok(Preflight {
+        estimate_secs,
+        estimate_mem_mb,
+        mem_mb_requested,
+        just_words,
+    })
+}
+
+fn worktree_name() -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn git_sha() -> Option<String> {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+/// Full run flow. On any gate failure (justification / seen-estimate / approval)
+/// returns Err(String) with human instructions and exit-code guidance (typed as Err).
+pub fn run(req: RunRequest, cfg: &Config) -> Result<RunResult, String> {
+    let cores = req.cores.max(1);
+    let state_dir = cfg.effective_state_dir();
+    let store = TimingStore::new(state_dir.join("timings.jsonl"));
+
+    let pre = validate_preflight(&req, cfg)?;
+    let estimate_secs = pre.estimate_secs;
+    let estimate_mem_mb = pre.estimate_mem_mb;
+    let mem_mb_requested = pre.mem_mb_requested;
+    let just_words = pre.just_words;
+
     // Budget admission (cores + memory, both must fit).
-    let run_id = make_run_id(&req.test);
+    let run_id = match req.run_id.as_deref() {
+        Some(id) => {
+            validate_run_id(id)?;
+            id.to_string()
+        }
+        None => make_run_id(&req.test),
+    };
     let broker = Broker::with_mem(state_dir.clone(), cfg.budget_cores, cfg.budget_mem_mb);
     let worktree = req.worktree.clone().unwrap_or_else(worktree_name);
     let pid = std::process::id() as i32;
@@ -339,7 +409,11 @@ pub fn run(req: RunRequest, cfg: &Config) -> Result<RunResult, String> {
         let _ = write_junit(&run_dir.join("junit.xml"), std::slice::from_ref(&summary));
     }
 
-    if req.verbose || outcome.rc != 0 {
+    if req.json {
+        if req.verbose {
+            eprintln!("[fuzz-next] done {} in {:.1}s", run_id, summary.secs);
+        }
+    } else if req.verbose || outcome.rc != 0 {
         println!("{}", format_human(&summary));
         if outcome.rc != 0 {
             println!("[fuzz-next] tail of stdout/stderr:");
@@ -397,7 +471,7 @@ fn print_estimate_and_justification_hint(
         est.effective_mem_mb,
     );
     println!();
-    println!("--- required justification + hypothesis (200+ words combined) ---");
+    println!("--- required justification + hypothesis (50+ words combined) ---");
     println!("The run command must include:");
     println!(
         "  --justification \"<why this run deserves {:.0} core-s + {:.0} mem-s RIGHT NOW>\" \\",
@@ -410,7 +484,7 @@ fn print_estimate_and_justification_hint(
     println!("  --seen-estimate-secs {:.0} \\", est.effective_secs);
     println!("  --seen-estimate-mem-mb {:.0}", est.effective_mem_mb);
     println!();
-    println!("Template questions to answer in 200+ words:");
+    println!("Template questions to answer in 50+ words:");
     println!("1. What exact question does this run answer, and which alternative (cheaper test, reading code, waiting) did we rule out?");
     println!("2. Why is THIS test the right tool (what invariant / proof / soak parameter does it cover)?");
     println!("3. Why NOW — what blocked us before, what unblocks after? What decision hinges on the result?");
@@ -429,6 +503,7 @@ pub fn opt_duration(v: Option<String>) -> Option<Duration> {
 #[cfg(test)]
 mod tests_runner {
     use super::*;
+    use crate::timings::count_words;
     #[test]
     fn run_id_unique_per_call() {
         let a = make_run_id("x");
@@ -467,11 +542,13 @@ mod tests_runner {
             verbose: false,
             worktree: None,
             sha: None,
+            run_id: None,
+            json: false,
         };
         let r = run(req, &cfg);
         assert!(r.is_err());
         let e = r.err().unwrap();
-        assert!(e.contains("200"));
+        assert!(e.contains("50"));
     }
     #[test]
     fn seen_estimate_gate_rejects_missing() {
@@ -507,9 +584,18 @@ mod tests_runner {
             verbose: false,
             worktree: None,
             sha: None,
+            run_id: None,
+            json: false,
         };
         let r = run(req, &cfg);
         assert!(r.is_err());
+    }
+    #[test]
+    fn validate_run_id_rejects_paths() {
+        assert!(validate_run_id("agent-a-1").is_ok());
+        assert!(validate_run_id("a/b").is_err());
+        assert!(validate_run_id("..").is_err());
+        assert!(validate_run_id("").is_err());
     }
     #[test]
     fn count_words_works_for_gate() {

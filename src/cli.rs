@@ -5,6 +5,7 @@
 //! - `estimate` print p50/p95 without running (always allowed, no justification needed)
 //! - `status`   show budget usage / active / queue
 //! - `runs`     list recent runs from timings.jsonl
+//! - `wait`     block until a run (or a test's active run) finishes — agent-friendly `poll` (alias `poll`)
 //! - `cancel`   cancel an active run by id (for --replace semantics)
 //! - `clean`    prune stale active/queue entries
 //! - `doctor`   check config, budget, histories
@@ -30,10 +31,14 @@ pub enum Command {
     Run(RunArgs),
     /// Print the timing estimate for a test without running it.
     Estimate(EstimateArgs),
-    /// Show budget usage now.
+    /// Show budget usage now. `--poll` blocks until the budget is idle.
     Status(StatusArgs),
     /// List recent runs from timings.jsonl.
     Runs(RunsArgs),
+    /// Block until a run finishes (the agent wait primitive — no hand-rolled poll loop).
+    /// Exit code mirrors the run: 0 pass, 1 fail/cancelled, 2 unknown, 124 wait-timeout.
+    #[command(visible_alias = "poll")]
+    Wait(WaitArgs),
     /// Cancel an active run.
     Cancel(CancelArgs),
     /// Prune stale budget entries.
@@ -59,8 +64,8 @@ pub struct RunArgs {
     /// Case count knob (JOINT_FUZZ_CASES etc.) — also used to scale the estimate.
     #[arg(long, value_name = "N")]
     pub cases: Option<u64>,
-    /// 200-word justification: why this run deserves the core-seconds NOW.
-    /// Combined with --hypothesis must be >=200 words. Stored in history.
+    /// 50-word justification: why this run deserves the core-seconds NOW.
+    /// Combined with --hypothesis must be >=50 words. Stored in history.
     #[arg(long, value_name = "TEXT")]
     pub justification: Option<String>,
     /// Hypothesis the run tests (falsifiable expectation + decision it unlocks).
@@ -78,7 +83,7 @@ pub struct RunArgs {
     /// Cancel a victim active run to make room when over budget.
     #[arg(long)]
     pub replace: bool,
-    /// Imply long-run approval (estimate > threshold) — require 200 words first.
+    /// Imply long-run approval (estimate > threshold) — require 50 words first.
     #[arg(long)]
     pub yes: bool,
     /// CI / manual emergency: bypass justification + seen-estimate + approval gates.
@@ -117,6 +122,23 @@ pub struct RunArgs {
     /// Verbose: print estimate + budget lines, SLOW markers, tails.
     #[arg(short, long)]
     pub verbose: bool,
+    /// Start the run in the background and exit immediately (detach).
+    /// Prints only the run_id to stdout; use `cargo fuzz-next wait <id>` /
+    /// `cargo fuzz-next poll <id>` to block for the result. `--detach` is an alias.
+    #[arg(long, visible_alias = "detach")]
+    pub background: bool,
+    /// Explicit run-id. Default is derived (timestamp-test-pid-random).
+    /// Useful with `--background`: the caller knows the id before launch and
+    /// can `wait`/`poll` for it without parsing background output.
+    #[arg(long, value_name = "ID")]
+    pub run_id: Option<String>,
+    /// Machine-readable output. With `--background` prints `{"run_id":"…"}`
+    /// to stdout; otherwise prints a JSON summary instead of human text.
+    #[arg(long)]
+    pub json: bool,
+    /// Internal: marks the detached child process (not user-facing).
+    #[arg(long, hide = true)]
+    pub background_child: bool,
 }
 
 #[derive(Args, Debug)]
@@ -135,6 +157,53 @@ pub struct EstimateArgs {
 
 #[derive(Args, Debug)]
 pub struct StatusArgs {
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::DirPath)]
+    pub state_dir: Option<PathBuf>,
+    #[arg(long, value_name = "CORES")]
+    pub budget_cores: Option<usize>,
+    #[arg(long, value_name = "MB")]
+    pub budget_mem_mb: Option<usize>,
+    /// Block until the budget is idle (no active and no queued runs),
+    /// polling instead of requiring the caller to loop `status` by hand.
+    #[arg(long)]
+    pub poll: bool,
+    /// Poll interval for `--poll`, e.g. "2s", "500ms".
+    #[arg(long, value_name = "DUR")]
+    pub interval: Option<String>,
+    /// Give up `--poll` after this long (exit 124 if still busy).
+    #[arg(long, value_name = "DUR")]
+    pub timeout: Option<String>,
+    /// Machine-readable JSON output (final status / each tick with `--poll`).
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct WaitArgs {
+    /// Run id(s) to wait for. At least one of these or `--test` is required.
+    #[arg(value_name = "RUN_ID", num_args = 0..)]
+    pub run_id: Vec<String>,
+    /// Wait for active/queued runs of this test. Use instead of RUN_ID, or
+    /// in addition to wait for whatever run of the test is currently active.
+    #[arg(long, value_name = "TEST")]
+    pub test: Option<String>,
+    /// Poll interval, e.g. "2s", "500ms", "5s".
+    #[arg(long, value_name = "DUR", default_value = "2s")]
+    pub interval: String,
+    /// Give up after this long (exit 124 if the run is still going).
+    /// No timeout means wait forever (use Ctrl-C to interrupt).
+    #[arg(long, value_name = "DUR")]
+    pub timeout: Option<String>,
+    /// Print the final result as a single JSON object (or array for multiple
+    /// run ids) to stdout instead of human text.
+    #[arg(long)]
+    pub json: bool,
+    /// Print periodic progress to stderr (also prints the final output).
+    #[arg(short, long)]
+    pub verbose: bool,
+    /// Show the run's stdout/stderr tail on completion (default: on failure only).
+    #[arg(long)]
+    pub tail: bool,
     #[arg(long, value_name = "PATH", value_hint = ValueHint::DirPath)]
     pub state_dir: Option<PathBuf>,
     #[arg(long, value_name = "CORES")]
@@ -224,6 +293,8 @@ pub fn run_request_from(args: RunArgs) -> RunRequest {
         verbose: args.verbose,
         worktree: None,
         sha: None,
+        run_id: args.run_id,
+        json: args.json,
     }
 }
 

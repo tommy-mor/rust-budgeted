@@ -16,7 +16,7 @@
 //! executor, and by refusing to launch more than budget cores of children at once.
 
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
@@ -42,6 +42,10 @@ pub struct ActiveRun {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedRun {
     pub id: String,
+    /// Pid of the waiting process (for duplicate-id detection on retry).
+    /// `None` on old queue files written before this field existed.
+    #[serde(default)]
+    pub pid: Option<i32>,
     pub test: String,
     pub cores: usize,
     #[serde(default = "default_mem_mb")]
@@ -231,6 +235,35 @@ impl Broker {
         let _lock = self.lock()?;
         let mut active = self.reap(self.load_active_unlocked());
         let mut queue = self.load_queue_unlocked();
+        // Duplicate-id guard: the same id from the same pid is the
+        // `wait_until_admitted` retry loop and must be idempotent; the same
+        // id from a *different* pid is two runs colliding on `--run-id`.
+        if let Some(existing) = active.iter().find(|r| r.id == id) {
+            if existing.pid == pid {
+                return Ok(Admission::Admitted {
+                    active_cores: self.active_cores(&active),
+                    active_mem_mb: self.active_mem(&active),
+                });
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("duplicate run id {id}: already active (pid {})", existing.pid),
+            ));
+        }
+        if let Some(pos) = queue.iter().position(|q| q.id == id) {
+            let existing = &queue[pos];
+            // Same pid (or legacy entry without a pid) is our own
+            // wait_until_admitted retry: fall through to the budget check so
+            // it can promote to Admitted once cores/mem free up. Only a
+            // *different* pid is a real collision.
+            if existing.pid.is_some() && existing.pid != Some(pid) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("duplicate run id {id}: already queued"),
+                ));
+            }
+            let _ = pos;
+        }
         let used_cores = self.active_cores(&active);
         let used_mem = self.active_mem(&active);
         let now = Utc::now();
@@ -273,9 +306,19 @@ impl Broker {
         let (eta_start, _) = self.eta(&active, &queue, cores);
         let eta_finish = eta_start + est_secs;
         if queue_mode {
+            // Our own retry (same pid, already queued) must not push a
+            // duplicate entry — just report the existing position.
+            if let Some(pos) = queue.iter().position(|q| q.id == id) {
+                return Ok(Admission::Queued {
+                    position: pos,
+                    eta_start_secs: eta_start,
+                    eta_finish_secs: eta_finish,
+                });
+            }
             let pos = queue.len();
             queue.push(QueuedRun {
                 id: id.to_string(),
+                pid: Some(pid),
                 test: test.to_string(),
                 cores,
                 mem_mb,
@@ -487,21 +530,51 @@ mod tests_budget {
         Broker::new(dir.path().to_path_buf(), 12)
     }
 
+    /// A pid that survives `reap` (unix `kill(pid,0)`). Sharing the test
+    /// process itself is live but must only be used when the test never
+    /// cancels/kills the entry (which would SIGTERM this process).
+    fn live_pid() -> i32 {
+        std::process::id() as i32
+    }
+
+    /// A live placeholder pid whose death is harmless (for `replace_victim`
+    /// which SIGTERMs the victim). On unix this is a throwaway `sleep`
+    /// child; elsewhere a fake id (Windows reap never prunes anyway).
+    fn victim_pid() -> (i32, Option<std::process::Child>) {
+        #[cfg(unix)]
+        {
+            let child = std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn sleep placeholder");
+            let pid = child.id() as i32;
+            (pid, Some(child))
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows keeps stale entries (reap is a no-op), so a fake id
+            // survives long enough for victim selection, and taskkill on it
+            // is a no-op that will not kill this process.
+            (999_991, None)
+        }
+    }
+
     #[test]
     fn admits_until_budget_then_queues() {
         let dir = tempfile::tempdir().unwrap();
         let b = broker(&dir);
+        let pid = live_pid();
         let a = b
-            .try_admit("r1", 111, "native_fuzz", 8, 500, 60.0, None, 200, true)
+            .try_admit("r1", pid, "native_fuzz", 8, 500, 60.0, None, 200, true)
             .unwrap();
         assert!(matches!(a, Admission::Admitted { .. }));
         let q = b
-            .try_admit("r2", 222, "post_match", 8, 500, 60.0, None, 200, true)
+            .try_admit("r2", pid, "post_match", 8, 500, 60.0, None, 200, true)
             .unwrap();
         assert!(matches!(q, Admission::Queued { .. }));
         // Reject mode when not queueing.
         let r = b
-            .try_admit("r3", 333, "ticker", 8, 500, 60.0, None, 200, false)
+            .try_admit("r3", pid, "ticker", 8, 500, 60.0, None, 200, false)
             .unwrap();
         assert!(matches!(r, Admission::Rejected { .. }));
         assert_eq!(b.active_cores_now().unwrap(), 8);
@@ -511,7 +584,7 @@ mod tests_budget {
     fn release_frees_cores() {
         let dir = tempfile::tempdir().unwrap();
         let b = broker(&dir);
-        b.try_admit("r1", 111, "a", 4, 500, 60.0, None, 200, true)
+        b.try_admit("r1", live_pid(), "a", 4, 500, 60.0, None, 200, true)
             .unwrap();
         b.release("r1").unwrap();
         assert_eq!(b.active_cores_now().unwrap(), 0);
@@ -521,28 +594,37 @@ mod tests_budget {
     fn replace_victim_picks_oldest() {
         let dir = tempfile::tempdir().unwrap();
         let b = broker(&dir);
-        b.try_admit("old", 111, "a", 4, 500, 60.0, None, 200, true)
+        let (pid_old, child_old) = victim_pid();
+        let (pid_new, child_new) = victim_pid();
+        b.try_admit("old", pid_old, "a", 4, 500, 60.0, None, 200, true)
             .unwrap();
         std::thread::sleep(Duration::from_millis(10));
-        b.try_admit("new", 222, "b", 4, 500, 60.0, None, 200, true)
+        b.try_admit("new", pid_new, "b", 4, 500, 60.0, None, 200, true)
             .unwrap();
         // Release/re-admit path keeps deterministic ordering by started_at (10ms gap).
         let v = b.replace_victim(4, 500).unwrap();
         assert_eq!(v.as_deref(), Some("old"));
+        // Cleanup placeholders (victim already SIGTERM'd by replace_victim).
+        let mut children = [child_old, child_new];
+        for c in children.iter_mut().flatten() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
     }
 
     #[test]
     fn mem_budget_is_enforced_separately() {
         let dir = tempfile::tempdir().unwrap();
         let b = Broker::with_mem(dir.path().to_path_buf(), 12, 1000);
+        let pid = live_pid();
         assert!(matches!(
-            b.try_admit("m1", 111, "a", 1, 900, 60.0, None, 200, true)
+            b.try_admit("m1", pid, "a", 1, 900, 60.0, None, 200, true)
                 .unwrap(),
             Admission::Admitted { .. }
         ));
         // Second 900 MiB exceeds 1000 MiB cap even though cores fit.
         assert!(matches!(
-            b.try_admit("m2", 222, "b", 1, 900, 60.0, None, 200, true)
+            b.try_admit("m2", pid, "b", 1, 900, 60.0, None, 200, true)
                 .unwrap(),
             Admission::Queued { .. }
         ));
