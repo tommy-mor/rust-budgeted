@@ -23,6 +23,86 @@ pub struct ExecOutcome {
     pub stdout_path: PathBuf,
     pub stderr_path: PathBuf,
     pub tail: String,
+    /// Peak RSS (MiB) of the whole process tree while running, if sampled.
+    pub peak_rss_mb: Option<f64>,
+}
+
+/// Sample total RSS (MiB) for `root_pid` + all descendants via /proc (unix).
+/// Returns None on Windows / if unavailable. Best-effort for budget history.
+#[must_use]
+pub fn sample_tree_rss_mb(root_pid: i32) -> Option<f64> {
+    #[cfg(unix)]
+    {
+        use std::collections::HashSet;
+        // Build pid->ppid map once per sample.
+        let mut ppid: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+        let mut rss: std::collections::HashMap<i32, f64> = std::collections::HashMap::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return None;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Ok(pid) = name.parse::<i32>() else {
+                continue;
+            };
+            let status_path = entry.path().join("status");
+            let Ok(text) = std::fs::read_to_string(status_path) else {
+                continue;
+            };
+            let mut pp = None;
+            let mut vmrss_kb = None;
+            for line in text.lines() {
+                if line.starts_with("PPid:") {
+                    pp = line
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|s| s.parse::<i32>().ok());
+                }
+                if line.starts_with("VmRSS:") {
+                    vmrss_kb = line
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|s| s.parse::<f64>().ok());
+                }
+            }
+            if let Some(ppv) = pp {
+                ppid.insert(pid, ppv);
+            }
+            if let Some(kb) = vmrss_kb {
+                rss.insert(pid, kb / 1024.0);
+            }
+        }
+        let mut subtree: HashSet<i32> = HashSet::new();
+        subtree.insert(root_pid);
+        // Expand until fixpoint (bounded by /proc size).
+        loop {
+            let mut added = false;
+            for (pid, parent) in &ppid {
+                if subtree.contains(parent) && !subtree.contains(pid) {
+                    subtree.insert(*pid);
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        let total_mb: f64 = subtree
+            .iter()
+            .map(|p| rss.get(p).copied().unwrap_or(0.0))
+            .sum();
+        if total_mb > 0.0 {
+            Some(total_mb)
+        } else {
+            None
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root_pid;
+        None
+    }
 }
 
 /// Build the cargo-test command for a per-binary run, with cooperative thread caps.
@@ -118,8 +198,11 @@ pub fn run_with_timeouts(
 
         let start = Instant::now();
         let mut child = cmd.spawn()?;
+        let child_pid = child.id() as i32;
         let mut slow_warned = false;
         let mut timed_out = false;
+        let mut peak_rss_mb: Option<f64> = None;
+        let mut last_sample = Instant::now();
 
         let terminate_at = global_timeout.or_else(|| {
             slow_timeout
@@ -128,6 +211,16 @@ pub fn run_with_timeouts(
         });
 
         loop {
+            // Sample peak RSS every ~200ms (cheap /proc walk on unix).
+            if last_sample.elapsed() >= Duration::from_millis(200) {
+                if let Some(mb) = sample_tree_rss_mb(child_pid) {
+                    peak_rss_mb = Some(match peak_rss_mb {
+                        Some(prev) => prev.max(mb),
+                        None => mb,
+                    });
+                }
+                last_sample = Instant::now();
+            }
             match child.try_wait()? {
                 Some(status) => {
                     let secs = start.elapsed().as_secs_f64();
@@ -178,6 +271,13 @@ pub fn run_with_timeouts(
                 }
             }
         }
+        // One final sample at exit.
+        if let Some(mb) = sample_tree_rss_mb(child_pid) {
+            peak_rss_mb = Some(match peak_rss_mb {
+                Some(prev) => prev.max(mb),
+                None => mb,
+            });
+        }
         // Collect tail for failure summaries.
         let tail = read_tail(&out_p, 50) + &read_tail(&err_p, 50);
         if last_rc == 0 || attempt == max_attempts {
@@ -194,6 +294,7 @@ pub fn run_with_timeouts(
                 stdout_path: out_p,
                 stderr_path: err_p,
                 tail,
+                peak_rss_mb,
             });
         }
         // Failed but retries remain.
@@ -230,6 +331,7 @@ pub fn run_with_timeouts(
             stdout_path: out_p,
             stderr_path: err_p,
             tail,
+            peak_rss_mb,
         });
     }
     Ok(ExecOutcome {
@@ -241,6 +343,7 @@ pub fn run_with_timeouts(
         stdout_path: stdout_path.clone(),
         stderr_path: stderr_path.clone(),
         tail: String::new(),
+        peak_rss_mb: None,
     })
 }
 

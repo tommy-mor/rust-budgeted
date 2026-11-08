@@ -30,6 +30,8 @@ pub struct ActiveRun {
     pub pid: i32,
     pub test: String,
     pub cores: usize,
+    #[serde(default = "default_mem_mb")]
+    pub mem_mb: usize,
     pub started_at: DateTime<Utc>,
     pub estimated_finish: DateTime<Utc>,
     pub worktree: Option<String>,
@@ -42,15 +44,22 @@ pub struct QueuedRun {
     pub id: String,
     pub test: String,
     pub cores: usize,
+    #[serde(default = "default_mem_mb")]
+    pub mem_mb: usize,
     pub enqueued_at: DateTime<Utc>,
     pub worktree: Option<String>,
     pub priority: i32,
+}
+
+fn default_mem_mb() -> usize {
+    1024
 }
 
 #[derive(Debug, Clone)]
 pub enum Admission {
     Admitted {
         active_cores: usize,
+        active_mem_mb: usize,
     },
     Queued {
         position: usize,
@@ -60,6 +69,9 @@ pub enum Admission {
     Rejected {
         active_cores: usize,
         budget_cores: usize,
+        active_mem_mb: usize,
+        budget_mem_mb: usize,
+        reason: String,
         eta_start_secs: f64,
         eta_finish_secs: f64,
     },
@@ -70,17 +82,34 @@ pub struct Broker {
     queue_path: PathBuf,
     lock_path: PathBuf,
     budget_cores: usize,
+    budget_mem_mb: usize,
 }
 
 impl Broker {
     #[must_use]
     pub fn new(state_dir: PathBuf, budget_cores: usize) -> Self {
+        Self::with_mem(state_dir, budget_cores, 1_000_000)
+    }
+
+    #[must_use]
+    pub fn with_mem(state_dir: PathBuf, budget_cores: usize, budget_mem_mb: usize) -> Self {
         Self {
             active_path: state_dir.join("active.json"),
             queue_path: state_dir.join("queue.json"),
             lock_path: state_dir.join("budget.lock"),
             budget_cores: budget_cores.max(1),
+            budget_mem_mb: budget_mem_mb.max(256),
         }
+    }
+
+    #[must_use]
+    pub fn budget_cores(&self) -> usize {
+        self.budget_cores
+    }
+
+    #[must_use]
+    pub fn budget_mem_mb(&self) -> usize {
+        self.budget_mem_mb
     }
 
     fn ensure_parent(path: &PathBuf) -> std::io::Result<()> {
@@ -144,6 +173,10 @@ impl Broker {
         active.iter().map(|r| r.cores).sum()
     }
 
+    fn active_mem(&self, active: &[ActiveRun]) -> usize {
+        active.iter().map(|r| r.mem_mb).sum()
+    }
+
     fn eta(&self, active: &[ActiveRun], queue: &[QueuedRun], extra_cores: usize) -> (f64, f64) {
         let now = Utc::now();
         let start_secs = active
@@ -163,6 +196,12 @@ impl Broker {
         Ok(self.active_cores(&active))
     }
 
+    pub fn active_mem_now(&self) -> Result<usize, std::io::Error> {
+        let _lock = self.lock()?;
+        let active = self.reap(self.load_active_unlocked());
+        Ok(self.active_mem(&active))
+    }
+
     pub fn list_active(&self) -> Result<Vec<ActiveRun>, std::io::Error> {
         let _lock = self.lock()?;
         let active = self.reap(self.load_active_unlocked());
@@ -175,7 +214,7 @@ impl Broker {
         Ok(self.load_queue_unlocked())
     }
 
-    /// Try to admit `cores` for `test`. On success the run is in active.json.
+    /// Try to admit `cores` + `mem_mb` for `test`. On success the run is in active.json.
     /// `est_secs` is the estimate effective secs used for ETA.
     pub fn try_admit(
         &self,
@@ -183,6 +222,7 @@ impl Broker {
         pid: i32,
         test: &str,
         cores: usize,
+        mem_mb: usize,
         est_secs: f64,
         worktree: Option<String>,
         justification_words: usize,
@@ -191,15 +231,19 @@ impl Broker {
         let _lock = self.lock()?;
         let mut active = self.reap(self.load_active_unlocked());
         let mut queue = self.load_queue_unlocked();
-        let used = self.active_cores(&active);
+        let used_cores = self.active_cores(&active);
+        let used_mem = self.active_mem(&active);
         let now = Utc::now();
-        if used + cores <= self.budget_cores {
+        let cores_ok = used_cores + cores <= self.budget_cores;
+        let mem_ok = used_mem + mem_mb <= self.budget_mem_mb;
+        if cores_ok && mem_ok {
             let est_finish = now + chrono::Duration::milliseconds((est_secs * 1000.0) as i64);
             active.push(ActiveRun {
                 id: id.to_string(),
                 pid,
                 test: test.to_string(),
                 cores,
+                mem_mb,
                 started_at: now,
                 estimated_finish: est_finish,
                 worktree,
@@ -211,10 +255,21 @@ impl Broker {
             queue.retain(|q| q.id != id);
             self.save_queue_unlocked(&queue)?;
             return Ok(Admission::Admitted {
-                active_cores: used + cores,
+                active_cores: used_cores + cores,
+                active_mem_mb: used_mem + mem_mb,
             });
         }
-        // Over budget.
+        // Over budget (either dimension).
+        let reason = if !cores_ok && !mem_ok {
+            format!(
+                "cores {used_cores}+{cores}>{} and mem {used_mem}+{mem_mb}>{}",
+                self.budget_cores, self.budget_mem_mb
+            )
+        } else if !cores_ok {
+            format!("cores {used_cores}+{cores}>{}", self.budget_cores)
+        } else {
+            format!("mem {used_mem}+{mem_mb}>{}", self.budget_mem_mb)
+        };
         let (eta_start, _) = self.eta(&active, &queue, cores);
         let eta_finish = eta_start + est_secs;
         if queue_mode {
@@ -223,6 +278,7 @@ impl Broker {
                 id: id.to_string(),
                 test: test.to_string(),
                 cores,
+                mem_mb,
                 enqueued_at: now,
                 worktree,
                 priority: 0,
@@ -235,8 +291,11 @@ impl Broker {
             })
         } else {
             Ok(Admission::Rejected {
-                active_cores: used,
+                active_cores: used_cores,
                 budget_cores: self.budget_cores,
+                active_mem_mb: used_mem,
+                budget_mem_mb: self.budget_mem_mb,
+                reason,
                 eta_start_secs: eta_start,
                 eta_finish_secs: eta_finish,
             })
@@ -292,9 +351,13 @@ impl Broker {
         Ok(true)
     }
 
-    /// Cancel the oldest (or lowest-priority) active run to free cores for `need_cores`.
+    /// Cancel the oldest (or lowest-priority) active run to free cores+mem.
     /// Returns the victim id, if any.
-    pub fn replace_victim(&self, need_cores: usize) -> Result<Option<String>, std::io::Error> {
+    pub fn replace_victim(
+        &self,
+        need_cores: usize,
+        need_mem_mb: usize,
+    ) -> Result<Option<String>, std::io::Error> {
         let victim = {
             let _lock = self.lock()?;
             let active = self.reap(self.load_active_unlocked());
@@ -304,10 +367,12 @@ impl Broker {
                 // Oldest started_at first.
                 let mut sorted = active.clone();
                 sorted.sort_by_key(|r| r.started_at);
-                // Prefer a victim that alone frees enough; else oldest.
+                // Prefer a victim that alone frees enough of both; else oldest.
                 let victim = sorted
                     .iter()
-                    .find(|r| r.cores >= need_cores)
+                    .find(|r| r.cores >= need_cores && r.mem_mb >= need_mem_mb)
+                    .or_else(|| sorted.iter().find(|r| r.mem_mb >= need_mem_mb))
+                    .or_else(|| sorted.iter().find(|r| r.cores >= need_cores))
                     .or(sorted.first())
                     .map(|r| r.id.clone());
                 victim
@@ -363,6 +428,7 @@ pub fn wait_until_admitted(
     pid: i32,
     test: &str,
     cores: usize,
+    mem_mb: usize,
     est_secs: f64,
     worktree: Option<String>,
     justification_words: usize,
@@ -374,6 +440,7 @@ pub fn wait_until_admitted(
             pid,
             test,
             cores,
+            mem_mb,
             est_secs,
             worktree.clone(),
             justification_words,
@@ -387,7 +454,7 @@ pub fn wait_until_admitted(
             } => {
                 if verbose {
                     eprintln!(
-                        "[fuzz-next] queued #{position} for {test}: starts in ~{eta_start_secs:.0}s (est {est_secs:.0}s, {cores} cores)"
+                        "[fuzz-next] queued #{position} for {test}: starts in ~{eta_start_secs:.0}s (est {est_secs:.0}s, {cores} cores, {mem_mb} MiB)"
                     );
                 }
                 std::thread::sleep(Duration::from_millis(500));
@@ -425,16 +492,16 @@ mod tests_budget {
         let dir = tempfile::tempdir().unwrap();
         let b = broker(&dir);
         let a = b
-            .try_admit("r1", 111, "native_fuzz", 8, 60.0, None, 200, true)
+            .try_admit("r1", 111, "native_fuzz", 8, 500, 60.0, None, 200, true)
             .unwrap();
         assert!(matches!(a, Admission::Admitted { .. }));
         let q = b
-            .try_admit("r2", 222, "post_match", 8, 60.0, None, 200, true)
+            .try_admit("r2", 222, "post_match", 8, 500, 60.0, None, 200, true)
             .unwrap();
         assert!(matches!(q, Admission::Queued { .. }));
         // Reject mode when not queueing.
         let r = b
-            .try_admit("r3", 333, "ticker", 8, 60.0, None, 200, false)
+            .try_admit("r3", 333, "ticker", 8, 500, 60.0, None, 200, false)
             .unwrap();
         assert!(matches!(r, Admission::Rejected { .. }));
         assert_eq!(b.active_cores_now().unwrap(), 8);
@@ -444,7 +511,7 @@ mod tests_budget {
     fn release_frees_cores() {
         let dir = tempfile::tempdir().unwrap();
         let b = broker(&dir);
-        b.try_admit("r1", 111, "a", 4, 60.0, None, 200, true)
+        b.try_admit("r1", 111, "a", 4, 500, 60.0, None, 200, true)
             .unwrap();
         b.release("r1").unwrap();
         assert_eq!(b.active_cores_now().unwrap(), 0);
@@ -454,13 +521,30 @@ mod tests_budget {
     fn replace_victim_picks_oldest() {
         let dir = tempfile::tempdir().unwrap();
         let b = broker(&dir);
-        b.try_admit("old", 111, "a", 4, 60.0, None, 200, true)
+        b.try_admit("old", 111, "a", 4, 500, 60.0, None, 200, true)
             .unwrap();
         std::thread::sleep(Duration::from_millis(10));
-        b.try_admit("new", 222, "b", 4, 60.0, None, 200, true)
+        b.try_admit("new", 222, "b", 4, 500, 60.0, None, 200, true)
             .unwrap();
         // Release/re-admit path keeps deterministic ordering by started_at (10ms gap).
-        let v = b.replace_victim(4).unwrap();
+        let v = b.replace_victim(4, 500).unwrap();
         assert_eq!(v.as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn mem_budget_is_enforced_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = Broker::with_mem(dir.path().to_path_buf(), 12, 1000);
+        assert!(matches!(
+            b.try_admit("m1", 111, "a", 1, 900, 60.0, None, 200, true)
+                .unwrap(),
+            Admission::Admitted { .. }
+        ));
+        // Second 900 MiB exceeds 1000 MiB cap even though cores fit.
+        assert!(matches!(
+            b.try_admit("m2", 222, "b", 1, 900, 60.0, None, 200, true)
+                .unwrap(),
+            Admission::Queued { .. }
+        ));
     }
 }

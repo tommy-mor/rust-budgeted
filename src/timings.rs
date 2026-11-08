@@ -42,6 +42,15 @@ pub struct TimingRecord {
     /// the agent actually looked up `estimate` instead of launching blind.
     #[serde(default)]
     pub seen_estimate_secs: Option<f64>,
+    /// Memory requested from the broker (MiB). Defaults to estimate when None.
+    #[serde(default)]
+    pub mem_mb_requested: Option<usize>,
+    /// Peak RSS measured for the process tree (MiB), if sampled.
+    #[serde(default)]
+    pub peak_rss_mb: Option<f64>,
+    /// Memory estimate the agent saw (MiB) — required like seen_estimate_secs.
+    #[serde(default)]
+    pub seen_estimate_mem_mb: Option<f64>,
 }
 
 /// Minimum combined words for justification + hypothesis.
@@ -90,15 +99,29 @@ pub fn validate_seen_estimate(seen: Option<f64>, effective_secs: f64) -> Result<
             "missing --seen-estimate-secs: run `cargo fuzz-next estimate --test <name> --cores <N>` first and pass --seen-estimate-secs {effective_secs:.0} in `run` to prove you saw the estimate. Effective p95 is {effective_secs:.0}s.",
         ));
     };
-    if seen <= 0.0 || !seen.is_finite() {
-        return Err(format!("--seen-estimate-secs must be positive, got {seen}"));
-    }
-    let lo = effective_secs * (1.0 - SEEN_ESTIMATE_TOLERANCE);
-    let hi = effective_secs * (1.0 + SEEN_ESTIMATE_TOLERANCE * 2.0); // allow 2x high-side generously
-    if seen < lo || seen > hi.max(effective_secs * 2.0) {
+    validate_seen_value(seen, effective_secs, "--seen-estimate-secs", "s")
+}
+
+/// Memory twin of the seen-estimate gate (MiB). Same tolerance logic.
+pub fn validate_seen_estimate_mem(seen: Option<f64>, effective_mb: f64) -> Result<(), String> {
+    let Some(seen) = seen else {
         return Err(format!(
-            "your --seen-estimate-secs {seen:.0}s doesn't match the store's effective estimate {effective_secs:.0}s (acceptable {lo:.0}..{:.0}s). Re-run `estimate` at your --cores/--cases and use that number.",
-            hi.max(effective_secs * 2.0)
+            "missing --seen-estimate-mem-mb: run `cargo fuzz-next estimate --test <name> --cores <N>` first and pass --seen-estimate-mem-mb {effective_mb:.0} in `run` to prove you saw the memory estimate. Effective mem p95 is {effective_mb:.0} MiB.",
+        ));
+    };
+    validate_seen_value(seen, effective_mb, "--seen-estimate-mem-mb", "MiB")
+}
+
+fn validate_seen_value(seen: f64, effective: f64, flag: &str, unit: &str) -> Result<(), String> {
+    if seen <= 0.0 || !seen.is_finite() {
+        return Err(format!("{flag} must be positive, got {seen}"));
+    }
+    let lo = effective * (1.0 - SEEN_ESTIMATE_TOLERANCE);
+    let hi = effective * (1.0 + SEEN_ESTIMATE_TOLERANCE * 2.0);
+    if seen < lo || seen > hi.max(effective * 2.0) {
+        return Err(format!(
+            "your {flag} {seen:.0}{unit} doesn't match the store's effective estimate {effective:.0}{unit} (acceptable {lo:.0}..{:.0}{unit}). Re-run `estimate` at your --cores/--cases/--mem-mb and use that number.",
+            hi.max(effective * 2.0)
         ));
     }
     Ok(())
@@ -120,6 +143,13 @@ pub struct Estimate {
     pub effective_secs: f64,
     /// Human-readable notes.
     pub notes: String,
+    /// Memory: p50/p95 MiB peak RSS (None = no samples).
+    pub mem_p50: Option<f64>,
+    pub mem_p95: Option<f64>,
+    /// Effective MiB to use for budget admission (p95 scaled, or default).
+    pub effective_mem_mb: f64,
+    /// mem-seconds cost = effective_secs * effective_mem_mb.
+    pub effective_mem_seconds: f64,
 }
 
 /// Built-in seed defaults from joint-fuzz `sweep_summary.txt` (release, 8 threads).
@@ -143,6 +173,45 @@ pub fn default_secs_for_test(test: &str) -> Option<f64> {
         "conformance" | "faults" | "partial_log" | "native_engine" => 90.0,
         _ => return None,
     })
+}
+
+/// Peak RSS defaults (MiB) at 8 threads, from observed `ps` + tree sums.
+/// These gate memory admission before history exists.
+#[must_use]
+pub fn default_mem_mb_for_test(test: &str) -> Option<f64> {
+    Some(match test {
+        "rooms" | "rooms_native" | "rooms_replay" => 400.0,
+        "end_screen" => 500.0,
+        "enter_match" => 600.0,
+        "match_routing" => 800.0,
+        "ticker" => 700.0,
+        "bot_hud" => 700.0,
+        "native_fuzz" => 1800.0,
+        "spectate" | "native_spectate" => 900.0,
+        "post_match" => 2500.0,
+        "replay_loop" | "result_side" => 1000.0,
+        "sweep" => 800.0,
+        "parallel" | "multi" | "multi_native" | "multi_sweep" => 2000.0,
+        "real_server" | "fuzz" => 1200.0,
+        "conformance" | "faults" | "partial_log" | "native_engine" => 1000.0,
+        _ => return None,
+    })
+}
+
+/// Memory scaling is sub-linear too but weaker than time: more threads = more
+/// stacks/arenas, roughly `^0.30`. 8→16 cores ≈ +23% RSS.
+#[must_use]
+pub fn mem_scale_factor(ref_cores: usize, cores: usize) -> f64 {
+    if ref_cores == cores || cores == 0 {
+        1.0
+    } else {
+        (cores as f64 / ref_cores as f64).powf(0.30)
+    }
+}
+
+#[must_use]
+pub fn scale_mem_mb(mb: f64, ref_cores: usize, cores: usize) -> f64 {
+    mb * mem_scale_factor(ref_cores, cores)
 }
 
 pub struct TimingStore {
@@ -222,6 +291,14 @@ impl TimingStore {
                 Some(c) if c > 0 => scaled * (c as f64 / default_cases_for_test(test) as f64),
                 _ => scaled,
             };
+            let mem_def = default_mem_mb_for_test(test).unwrap_or(1024.0);
+            let mem_scaled = scale_mem_mb(mem_def, 8, cores);
+            let mem_scaled = match cases {
+                Some(c) if c > 0 => mem_scaled * (c as f64 / default_cases_for_test(test) as f64),
+                _ => mem_scaled,
+            };
+            let eff_secs = (scaled * 1.20).max(scaled);
+            let eff_mem = (mem_scaled * 1.20).max(mem_scaled);
             return Estimate {
                 test: test.to_string(),
                 cores,
@@ -231,8 +308,12 @@ impl TimingStore {
                 n: 0,
                 last_secs: None,
                 from_defaults: true,
-                effective_secs: (scaled * 1.20).max(scaled),
+                effective_secs: eff_secs,
                 notes: format!("no history; built-in default scaled to {cores} cores"),
+                mem_p50: Some(mem_scaled),
+                mem_p95: Some((mem_scaled * 1.20).max(mem_scaled)),
+                effective_mem_mb: eff_mem,
+                effective_mem_seconds: eff_secs * eff_mem,
             };
         }
         // Prefer same-case-count samples when cases filters; otherwise all samples.
@@ -266,6 +347,47 @@ impl TimingStore {
         let p95s = scale(p95);
         let p99s = scale(p99);
         let effective = p95s.or(p50s).unwrap_or(60.0);
+        // Memory branch: peak RSS samples scaled by mem factor.
+        let mem_raw: Vec<f64> = all
+            .iter()
+            .filter(|r| r.test == test || r.binary.as_deref() == Some(test))
+            .filter_map(|r| r.peak_rss_mb)
+            .filter(|v| *v > 0.0)
+            .map(|v| {
+                // Scale each sample from its own cores to requested cores.
+                let rc = 8usize.max(1); // fallback; true per-sample cores below
+                let _ = rc;
+                v
+            })
+            .collect();
+        // Proper per-sample scaling needs each record's cores — collect with cores.
+        let mem_samples: Vec<(f64, usize)> = all
+            .iter()
+            .filter(|r| r.test == test || r.binary.as_deref() == Some(test))
+            .filter_map(|r| r.peak_rss_mb.map(|mb| (mb, r.cores.max(1))))
+            .filter(|(mb, _)| *mb > 0.0)
+            .collect();
+        let (mem_p50, mem_p95, eff_mem) = if mem_samples.is_empty() {
+            let def = default_mem_mb_for_test(test).unwrap_or(1024.0);
+            let scaled = scale_mem_mb(def, 8, cores);
+            (
+                Some(scaled),
+                Some((scaled * 1.20).max(scaled)),
+                (scaled * 1.20).max(scaled),
+            )
+        } else {
+            let mids: Vec<usize> = mem_samples.iter().map(|(_, c)| *c).collect();
+            let mut mids_sorted = mids.clone();
+            mids_sorted.sort_unstable();
+            let ref_mem_cores = mids_sorted[mids_sorted.len() / 2].max(1);
+            let mf = mem_scale_factor(ref_mem_cores, cores);
+            let scaled: Vec<f64> = mem_samples.iter().map(|(mb, _)| mb * mf).collect();
+            let p50 = percentile(&scaled, 0.50);
+            let p95 = percentile(&scaled, 0.95);
+            let eff = p95.or(p50).unwrap_or(1024.0);
+            (p50, p95, eff)
+        };
+        let _ = mem_raw;
         Estimate {
             test: test.to_string(),
             cores,
@@ -277,6 +399,10 @@ impl TimingStore {
             from_defaults: false,
             effective_secs: effective,
             notes: format!("n={} ref_cores={} factor={factor:.2}", raw.len(), ref_cores),
+            mem_p50,
+            mem_p95,
+            effective_mem_mb: eff_mem,
+            effective_mem_seconds: effective * eff_mem,
         }
     }
 
@@ -355,6 +481,9 @@ mod tests_timings {
             justification: None,
             hypothesis: None,
             seen_estimate_secs: None,
+            mem_mb_requested: None,
+            peak_rss_mb: None,
+            seen_estimate_mem_mb: None,
         }
     }
 

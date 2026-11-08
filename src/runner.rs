@@ -17,11 +17,13 @@ use crate::util::{parse_duration, RetryPolicy};
 pub struct RunRequest {
     pub test: String,
     pub cores: usize,
+    pub mem_mb: Option<usize>,
     pub release: bool,
     pub cases: Option<u64>,
     pub justification: Option<String>,
     pub hypothesis: Option<String>,
     pub seen_estimate_secs: Option<f64>,
+    pub seen_estimate_mem_mb: Option<f64>,
     pub queue_mode: bool,
     pub replace: bool,
     pub yes: bool,
@@ -42,8 +44,10 @@ pub struct RunResult {
     pub summary: RunSummary,
     pub run_id: String,
     pub estimate_secs: f64,
+    pub estimate_mem_mb: f64,
     pub record: TimingRecord,
     pub budget_active_cores_after: usize,
+    pub budget_active_mem_after: usize,
 }
 
 fn make_run_id(test: &str) -> String {
@@ -83,19 +87,35 @@ pub fn run(req: RunRequest, cfg: &Config) -> Result<RunResult, String> {
     let store = TimingStore::new(state_dir.join("timings.jsonl"));
     let est = store.estimate(&req.test, cores, req.cases);
     let estimate_secs = est.effective_secs;
+    let estimate_mem_mb = est.effective_mem_mb;
+    // Explicit --mem-mb wins over the estimate; otherwise budget the estimate.
+    let mem_mb_requested = req
+        .mem_mb
+        .unwrap_or(estimate_mem_mb.ceil() as usize)
+        .max(64);
 
     if req.verbose {
         eprintln!(
-            "[fuzz-next] estimate for `{}` @ {} cores: p50={:?} p95={:?} eff={:.0}s n={} {}",
+            "[fuzz-next] estimate for `{}` @ {} cores / {} MiB: time p50={:?} p95={:?} eff={:.0}s mem p95={:?} eff={:.0}MiB n={} {}",
             req.test,
             cores,
+            mem_mb_requested,
             est.p50,
             est.p95,
             estimate_secs,
+            est.mem_p95,
+            estimate_mem_mb,
             est.n,
             if est.from_defaults { "(defaults)" } else { "" }
         );
         eprintln!("[fuzz-next] {}", est.notes);
+        eprintln!(
+            "[fuzz-next] cost: {:.0} core-s + {:.0} mem-s ({}s x {}MiB)",
+            estimate_secs * cores as f64,
+            est.effective_mem_seconds,
+            estimate_secs,
+            estimate_mem_mb,
+        );
     }
 
     // Gate: justification + hypothesis (unless explicitly allowed away for tests/CI).
@@ -119,41 +139,64 @@ pub fn run(req: RunRequest, cfg: &Config) -> Result<RunResult, String> {
             print_estimate_and_justification_hint(&est, cores, req.cases);
             return Err(e);
         }
+        if let Err(e) =
+            crate::timings::validate_seen_estimate_mem(req.seen_estimate_mem_mb, estimate_mem_mb)
+        {
+            eprintln!("[fuzz-next] BLOCKED: {e}");
+            print_estimate_and_justification_hint(&est, cores, req.cases);
+            return Err(e);
+        }
     }
 
-    // Gate: long-run approval. >threshold needs --yes (or interactive).
-    if estimate_secs > cfg.approval_threshold.as_secs_f64()
-        && !req.yes
-        && !req.allow_no_justification
-    {
-        let msg = format!(
-            "estimated {:.0}s exceeds approval threshold {} — rerun with --yes after reading the estimate and writing the justification. This run asks for {:.0} core-seconds ({}s x {} cores).",
-            estimate_secs,
-            fmt_dur(cfg.approval_threshold),
+    // Gates: long-run / big-mem approval. >threshold needs --yes.
+    let time_over = estimate_secs > cfg.approval_threshold.as_secs_f64();
+    let mem_over = estimate_mem_mb > cfg.mem_approval_threshold_mb as f64;
+    if (time_over || mem_over) && !req.yes && !req.allow_no_justification {
+        let mut msg = String::new();
+        if time_over {
+            msg.push_str(&format!(
+                "estimated {:.0}s exceeds approval threshold {} ",
+                estimate_secs,
+                fmt_dur(cfg.approval_threshold),
+            ));
+        }
+        if mem_over {
+            msg.push_str(&format!(
+                "estimated {:.0}MiB exceeds memory approval threshold {}MiB ",
+                estimate_mem_mb, cfg.mem_approval_threshold_mb,
+            ));
+        }
+        msg.push_str(&format!(
+            "— rerun with --yes after reading the estimate and writing the justification. This run asks for {:.0} core-seconds + {:.0} mem-seconds ({}s x {} cores / {}MiB).",
             estimate_secs * cores as f64,
+            est.effective_mem_seconds,
             estimate_secs,
             cores,
-        );
+            estimate_mem_mb as usize,
+        ));
         eprintln!("[fuzz-next] NEEDS-APPROVAL: {msg}");
         print_estimate_and_justification_hint(&est, cores, req.cases);
         return Err(format!("NEEDS-APPROVAL: {msg}"));
     }
 
-    // Budget admission.
+    // Budget admission (cores + memory, both must fit).
     let run_id = make_run_id(&req.test);
-    let broker = Broker::new(state_dir.clone(), cfg.budget_cores);
+    let broker = Broker::with_mem(state_dir.clone(), cfg.budget_cores, cfg.budget_mem_mb);
     let worktree = req.worktree.clone().unwrap_or_else(worktree_name);
     let pid = std::process::id() as i32;
     let sha = req.sha.clone().or_else(git_sha);
 
     // Reap / pre-check for ETA display.
-    let active_now = broker
+    let active_cores = broker
         .active_cores_now()
+        .map_err(|e| format!("broker: {e}"))?;
+    let active_mem = broker
+        .active_mem_now()
         .map_err(|e| format!("broker: {e}"))?;
     if req.verbose {
         eprintln!(
-            "[fuzz-next] budget {active_now}/{} cores in use (cap {})",
-            cfg.budget_cores, cfg.budget_cores
+            "[fuzz-next] budget {active_cores}/{} cores + {active_mem}/{} MiB in use",
+            cfg.budget_cores, cfg.budget_mem_mb
         );
     }
 
@@ -163,6 +206,7 @@ pub fn run(req: RunRequest, cfg: &Config) -> Result<RunResult, String> {
             pid,
             &req.test,
             cores,
+            mem_mb_requested,
             estimate_secs,
             Some(worktree.clone()),
             just_words,
@@ -178,15 +222,16 @@ pub fn run(req: RunRequest, cfg: &Config) -> Result<RunResult, String> {
             eta_finish_secs,
         } => {
             eprintln!(
-                "[fuzz-next] QUEUED #{position} for {}: starts in ~{}s, finishes in ~{}s ({} cores). Waiting…",
+                "[fuzz-next] QUEUED #{position} for {}: starts in ~{}s, finishes in ~{}s ({} cores / {}MiB). Waiting…",
                 req.test,
                 eta_start_secs as i64,
                 eta_finish_secs as i64,
                 cores,
+                mem_mb_requested,
             );
             if req.replace {
-                if let Ok(Some(victim)) = broker.replace_victim(cores) {
-                    eprintln!("[fuzz-next] --replace: cancelled victim {victim} to free cores");
+                if let Ok(Some(victim)) = broker.replace_victim(cores, mem_mb_requested) {
+                    eprintln!("[fuzz-next] --replace: cancelled victim {victim} to free cores+mem");
                 }
             }
             // Block until admitted (poll).
@@ -196,6 +241,7 @@ pub fn run(req: RunRequest, cfg: &Config) -> Result<RunResult, String> {
                 pid,
                 &req.test,
                 cores,
+                mem_mb_requested,
                 estimate_secs,
                 Some(worktree.clone()),
                 just_words,
@@ -206,11 +252,14 @@ pub fn run(req: RunRequest, cfg: &Config) -> Result<RunResult, String> {
         Admission::Rejected {
             active_cores,
             budget_cores,
+            active_mem_mb,
+            budget_mem_mb,
+            reason,
             eta_start_secs,
             eta_finish_secs,
         } => {
             let msg = format!(
-                "REJECTED: need {cores} cores, have {active_cores}/{budget_cores} in use. Starts in ~{eta_start_secs:.0}s, finishes in ~{eta_finish_secs:.0}s. Rerun without --no-queue (queue mode) or with --replace to cancel a victim.",
+                "REJECTED ({reason}): cores {active_cores}/{budget_cores}, mem {active_mem_mb}/{budget_mem_mb} MiB in use. Need {cores} cores / {mem_mb_requested}MiB. Starts in ~{eta_start_secs:.0}s, finishes in ~{eta_finish_secs:.0}s. Rerun without --no-queue (queue mode) or with --replace to cancel a victim.",
             );
             eprintln!("[fuzz-next] {msg}");
             return Err(msg);
@@ -265,13 +314,17 @@ pub fn run(req: RunRequest, cfg: &Config) -> Result<RunResult, String> {
         justification: req.justification.clone(),
         hypothesis: req.hypothesis.clone(),
         seen_estimate_secs: req.seen_estimate_secs,
+        mem_mb_requested: Some(mem_mb_requested),
+        peak_rss_mb: outcome.peak_rss_mb,
+        seen_estimate_mem_mb: req.seen_estimate_mem_mb,
     };
     // Best-effort timing append; failure shouldn't fail the run but warn.
     if let Err(e) = store.append(&record) {
         eprintln!("[fuzz-next] WARN: failed to append timings.jsonl: {e}");
     }
 
-    let mut summary = RunSummary::from_record(&record, estimate_secs, outcome.attempts);
+    let mut summary =
+        RunSummary::from_record(&record, estimate_secs, estimate_mem_mb, outcome.attempts);
     summary.stdout_path = outcome.stdout_path.to_string_lossy().to_string();
     summary.stderr_path = outcome.stderr_path.to_string_lossy().to_string();
 
@@ -301,13 +354,16 @@ pub fn run(req: RunRequest, cfg: &Config) -> Result<RunResult, String> {
 
     // Release budget (drop session entry).
     let _ = broker.release(&run_id);
-    let after = broker.active_cores_now().unwrap_or(0);
+    let after_cores = broker.active_cores_now().unwrap_or(0);
+    let after_mem = broker.active_mem_now().unwrap_or(0);
     Ok(RunResult {
         summary,
         run_id,
         estimate_secs,
+        estimate_mem_mb,
         record,
-        budget_active_cores_after: after,
+        budget_active_cores_after: after_cores,
+        budget_active_mem_after: after_mem,
     })
 }
 
@@ -328,22 +384,31 @@ fn print_estimate_and_justification_hint(
         est.effective_secs, est.notes
     );
     println!(
-        "core-seconds: {:.0} ({}s x {} cores)",
+        "effective mem (p95): {:.0} MiB (mem p50={:?} p95={:?})",
+        est.effective_mem_mb, est.mem_p50, est.mem_p95
+    );
+    println!(
+        "core-seconds: {:.0} ({}s x {} cores)  mem-seconds: {:.0} ({}s x {:.0}MiB)",
         est.effective_secs * cores as f64,
         est.effective_secs,
-        cores
+        cores,
+        est.effective_mem_seconds,
+        est.effective_secs,
+        est.effective_mem_mb,
     );
     println!();
     println!("--- required justification + hypothesis (200+ words combined) ---");
     println!("The run command must include:");
     println!(
-        "  --justification \"<why this run deserves {:.0} core-seconds RIGHT NOW>\" \\",
-        est.effective_secs * cores as f64
+        "  --justification \"<why this run deserves {:.0} core-s + {:.0} mem-s RIGHT NOW>\" \\",
+        est.effective_secs * cores as f64,
+        est.effective_mem_seconds,
     );
     println!(
         "  --hypothesis \"<what we expect to learn / falsify, and what decision it unlocks>\" \\"
     );
-    println!("  --seen-estimate-secs {:.0}", est.effective_secs);
+    println!("  --seen-estimate-secs {:.0} \\", est.effective_secs);
+    println!("  --seen-estimate-mem-mb {:.0}", est.effective_mem_mb);
     println!();
     println!("Template questions to answer in 200+ words:");
     println!("1. What exact question does this run answer, and which alternative (cheaper test, reading code, waiting) did we rule out?");
@@ -373,11 +438,6 @@ mod tests_runner {
     }
     #[test]
     fn justification_gate_rejects_short() {
-        let cfg = Config {
-            budget_cores: 12,
-            state_dir: Some(tempfile::tempdir().unwrap().keep().join("sd")),
-            ..Default::default()
-        };
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config {
             state_dir: Some(dir.path().to_path_buf()),
@@ -386,11 +446,13 @@ mod tests_runner {
         let req = RunRequest {
             test: "rooms".into(),
             cores: 2,
+            mem_mb: None,
             release: false,
             cases: None,
             justification: Some("too short".into()),
             hypothesis: Some("also short".into()),
             seen_estimate_secs: Some(30.0),
+            seen_estimate_mem_mb: Some(400.0),
             queue_mode: false,
             replace: false,
             yes: false,
@@ -424,11 +486,13 @@ mod tests_runner {
         let req = RunRequest {
             test: "rooms".into(),
             cores: 2,
+            mem_mb: None,
             release: false,
             cases: None,
             justification: Some(justification),
             hypothesis: Some(hypothesis),
             seen_estimate_secs: None,
+            seen_estimate_mem_mb: None,
             queue_mode: false,
             replace: false,
             yes: false,

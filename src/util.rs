@@ -10,6 +10,36 @@ pub fn num_cpus() -> usize {
         .unwrap_or(1)
 }
 
+/// Total physical RAM in MiB (best-effort, cross-platform).
+#[must_use]
+pub fn total_physical_mem_mb() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
+            for line in text.lines() {
+                let line = line.trim();
+                if line.starts_with("MemTotal:") {
+                    // "MemTotal:  16306736 kB"
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        if let Ok(kb) = parts[1].parse::<usize>() {
+                            return (kb / 1024).max(256);
+                        }
+                    }
+                }
+            }
+        }
+        // /proc/stat fallback: total RAM from /proc/meminfo else 8GB.
+    }
+    #[cfg(windows)]
+    {
+        // GlobalMemoryStatusEx would need windows crate; fallback to env is fine.
+        // The broker only uses this for a sane default budget.
+    }
+    // Reasonable default for test / unknown hosts.
+    8192
+}
+
 /// Parse a duration like "5m", "60s", "2h", "1h30m", "300" into seconds (f64).
 /// Returns None on parse failure.
 #[must_use]

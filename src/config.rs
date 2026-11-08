@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::util::{num_cpus, parse_duration};
+use crate::util::{num_cpus, parse_duration, total_physical_mem_mb};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -25,8 +25,15 @@ pub struct Config {
     pub budget_cores: usize,
     /// Cores to keep for the desktop (used to derive default budget = ncpus - reserved).
     pub reserved_cores: usize,
+    /// Total MiB the broker may hand out at once (across all worktrees/agents).
+    /// Defaults to total_physical_mem - reserved, clamped.
+    pub budget_mem_mb: usize,
+    /// MiB to keep for the desktop (used to derive default mem budget).
+    pub reserved_mem_mb: usize,
     /// p95 estimate above this (secs) requires explicit --yes / approval.
     pub approval_threshold: Duration,
+    /// p95 peak-RSS above this (MiB) requires explicit --yes / approval.
+    pub mem_approval_threshold_mb: usize,
     /// When a test is marked SLOW (log only).
     pub slow_timeout: Duration,
     /// Where timings.jsonl lives (override for tests / per-repo DBs).
@@ -38,10 +45,19 @@ impl Default for Config {
         let ncpus = num_cpus();
         let reserved = 4usize.min(ncpus.saturating_sub(1).max(1).min(4));
         let budget = ncpus.saturating_sub(reserved).max(1);
+        // Memory: reserve ~50% for desktop/Chrome/agents, at least 4 GiB.
+        let total = total_physical_mem_mb().max(2048);
+        let reserved_mem = (total / 2)
+            .max(4096)
+            .min(total.saturating_sub(1024).max(1024));
+        let budget_mem = total.saturating_sub(reserved_mem).max(1024);
         Self {
             budget_cores: budget,
             reserved_cores: reserved,
+            budget_mem_mb: budget_mem,
+            reserved_mem_mb: reserved_mem,
             approval_threshold: Duration::from_secs(300),
+            mem_approval_threshold_mb: 4096,
             slow_timeout: Duration::from_secs(60),
             state_dir: None,
         }
@@ -89,6 +105,25 @@ impl Config {
                         cfg.budget_cores = num_cpus().saturating_sub(n).max(1);
                     }
                 }
+                "budget-mem" | "budget-mem-mb" | "budget_mem" | "budget_mem_mb" => {
+                    if let Ok(n) = v.parse::<usize>() {
+                        cfg.budget_mem_mb = n.max(256);
+                    }
+                }
+                "reserved-mem" | "reserved-mem-mb" | "reserved_mem" | "reserved_mem_mb" => {
+                    if let Ok(n) = v.parse::<usize>() {
+                        cfg.reserved_mem_mb = n;
+                        let total = total_physical_mem_mb().max(2048);
+                        cfg.budget_mem_mb = total.saturating_sub(n).max(1024);
+                    }
+                }
+                "mem-approval-threshold"
+                | "mem-approval-threshold-mb"
+                | "mem_approval_threshold" => {
+                    if let Ok(n) = v.parse::<usize>() {
+                        cfg.mem_approval_threshold_mb = n;
+                    }
+                }
                 "approval-threshold" | "approval_threshold" => {
                     if let Some(d) = parse_duration(v) {
                         cfg.approval_threshold = d;
@@ -106,6 +141,16 @@ impl Config {
         if let Ok(s) = std::env::var("FUZZ_NEXT_BUDGET_CORES") {
             if let Ok(n) = s.parse::<usize>() {
                 cfg.budget_cores = n.max(1);
+            }
+        }
+        if let Ok(s) = std::env::var("FUZZ_NEXT_BUDGET_MEM_MB") {
+            if let Ok(n) = s.parse::<usize>() {
+                cfg.budget_mem_mb = n.max(256);
+            }
+        }
+        if let Ok(s) = std::env::var("FUZZ_NEXT_MEM_APPROVAL_THRESHOLD_MB") {
+            if let Ok(n) = s.parse::<usize>() {
+                cfg.mem_approval_threshold_mb = n;
             }
         }
         if let Ok(s) = std::env::var("FUZZ_NEXT_APPROVAL_THRESHOLD") {

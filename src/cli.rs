@@ -50,6 +50,9 @@ pub struct RunArgs {
     /// Cores to request from the global budget (also caps child thread pools via env).
     #[arg(long, default_value_t = 8)]
     pub cores: usize,
+    /// Memory to request from the global budget (MiB). Defaults to the estimate.
+    #[arg(long, value_name = "MB")]
+    pub mem_mb: Option<usize>,
     /// Use --release for cargo test.
     #[arg(long)]
     pub release: bool,
@@ -66,6 +69,9 @@ pub struct RunArgs {
     /// Estimate wall seconds you saw from `cargo fuzz-next estimate` (proves you looked).
     #[arg(long, value_name = "SECS")]
     pub seen_estimate_secs: Option<f64>,
+    /// Memory estimate you saw (MiB) — also required.
+    #[arg(long, value_name = "MB")]
+    pub seen_estimate_mem_mb: Option<f64>,
     /// Queue when over budget (default). --no-queue rejects instead.
     #[arg(long)]
     pub no_queue: bool,
@@ -99,6 +105,9 @@ pub struct RunArgs {
     /// Global budget cores (default: ncpus - 4 reserved).
     #[arg(long, value_name = "CORES")]
     pub budget_cores: Option<usize>,
+    /// Global budget memory in MiB (default: total RAM - reserved).
+    #[arg(long, value_name = "MB")]
+    pub budget_mem_mb: Option<usize>,
     /// Extra args to pass to `cargo test` (before --).
     #[arg(long, value_name = "ARG", num_args = 0..)]
     pub cargo_args: Vec<String>,
@@ -116,6 +125,8 @@ pub struct EstimateArgs {
     pub test: String,
     #[arg(long, default_value_t = 8)]
     pub cores: usize,
+    #[arg(long, value_name = "MB")]
+    pub mem_mb: Option<usize>,
     #[arg(long, value_name = "N")]
     pub cases: Option<u64>,
     #[arg(long, value_name = "PATH", value_hint = ValueHint::DirPath)]
@@ -128,6 +139,8 @@ pub struct StatusArgs {
     pub state_dir: Option<PathBuf>,
     #[arg(long, value_name = "CORES")]
     pub budget_cores: Option<usize>,
+    #[arg(long, value_name = "MB")]
+    pub budget_mem_mb: Option<usize>,
 }
 
 #[derive(Args, Debug)]
@@ -166,13 +179,20 @@ pub fn parse() -> Cli {
 
 /// Build a `Config` from CLI state-dir / budget overrides + file.
 #[must_use]
-pub fn config_for(state_dir: Option<PathBuf>, budget_cores: Option<usize>) -> Config {
+pub fn config_for(
+    state_dir: Option<PathBuf>,
+    budget_cores: Option<usize>,
+    budget_mem_mb: Option<usize>,
+) -> Config {
     let mut cfg = Config::load(None);
     if let Some(sd) = state_dir {
         cfg.state_dir = Some(sd);
     }
     if let Some(bc) = budget_cores {
         cfg.budget_cores = bc.max(1);
+    }
+    if let Some(bm) = budget_mem_mb {
+        cfg.budget_mem_mb = bm.max(256);
     }
     cfg
 }
@@ -183,11 +203,13 @@ pub fn run_request_from(args: RunArgs) -> RunRequest {
     RunRequest {
         test: args.test,
         cores: args.cores,
+        mem_mb: args.mem_mb,
         release: args.release,
         cases: args.cases,
         justification: args.justification,
         hypothesis: args.hypothesis,
         seen_estimate_secs: args.seen_estimate_secs,
+        seen_estimate_mem_mb: args.seen_estimate_mem_mb,
         queue_mode: !args.no_queue,
         replace: args.replace,
         yes: args.yes,

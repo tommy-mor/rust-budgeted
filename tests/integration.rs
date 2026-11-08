@@ -1,7 +1,8 @@
 //! Integration tests: gates + budget + timings end-to-end with fakes (no cargo build).
 
 use cargo_fuzz_next::timings::{
-    count_words, validate_justification, validate_seen_estimate, TimingStore,
+    count_words, validate_justification, validate_seen_estimate, validate_seen_estimate_mem,
+    TimingStore,
 };
 
 fn long_text(words: usize) -> String {
@@ -28,6 +29,14 @@ fn seen_estimate_gate_proves_agent_looked() {
 }
 
 #[test]
+fn seen_estimate_mem_gate_proves_memory_looked() {
+    assert!(validate_seen_estimate_mem(Some(1700.0), 1800.0).is_ok());
+    assert!(validate_seen_estimate_mem(Some(3000.0), 1800.0).is_ok());
+    assert!(validate_seen_estimate_mem(Some(300.0), 1800.0).is_err());
+    assert!(validate_seen_estimate_mem(None, 1800.0).is_err());
+}
+
+#[test]
 fn timings_store_full_cycle_with_justification_fields() {
     use cargo_fuzz_next::timings::TimingRecord;
     use chrono::Utc;
@@ -48,6 +57,9 @@ fn timings_store_full_cycle_with_justification_fields() {
         justification: Some(long_text(150)),
         hypothesis: Some(long_text(60)),
         seen_estimate_secs: Some(368.0),
+        mem_mb_requested: Some(1800),
+        peak_rss_mb: Some(1500.0),
+        seen_estimate_mem_mb: Some(1800.0),
     };
     store.append(&rec).unwrap();
     let all = store.load_all();
@@ -72,6 +84,7 @@ fn budget_broker_cross_worktree_semantics() {
             111,
             "native_fuzz",
             8,
+            500,
             60.0,
             Some("wt-a".into()),
             200,
@@ -87,6 +100,7 @@ fn budget_broker_cross_worktree_semantics() {
             222,
             "post_match",
             8,
+            500,
             60.0,
             Some("wt-b".into()),
             200,
@@ -96,7 +110,7 @@ fn budget_broker_cross_worktree_semantics() {
         Admission::Queued { .. }
     ));
     // --replace victim picks oldest (a1).
-    let v = b.replace_victim(8).unwrap();
+    let v = b.replace_victim(8, 500).unwrap();
     assert_eq!(v.as_deref(), Some("a1"));
     // After replace, B can be admitted on retry.
     assert!(matches!(
@@ -105,6 +119,7 @@ fn budget_broker_cross_worktree_semantics() {
             222,
             "post_match",
             8,
+            500,
             60.0,
             Some("wt-b".into()),
             200,
